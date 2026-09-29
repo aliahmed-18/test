@@ -1,0 +1,30 @@
+# docker compose up --build   →  http://localhost:8080
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: getit
+      POSTGRES_PASSWORD: getit
+      POSTGRES_DB: getit
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U getit"]
+      interval: 2s
+      retries: 20
+
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      DATABASE_URL: postgres://getit:getit@db:5432/getit?sslmode=disable
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?Set ANTHROPIC_API_KEY in .env or your shell}
+      SIMILARITY_THRESHOLD: ${SIMILARITY_THRESHOLD:-0.65}
+      CLASSIFIER_MODEL: ${CLASSIFIER_MODEL:-claude-opus-5}
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  db-data:

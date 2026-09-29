@@ -1,10 +1,17 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useMemo, useState, type ReactNode } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { Logo } from '../components/Logo'
 import { GroupCard, QuestionCard } from '../components/QuestionViews'
-import { ANALYZING_GRACE_MS, questionState, useNow } from '../lib/questionState'
+import { questionState, useNow } from '../lib/questionState'
 import { useLiveSession, type ConnectionState } from '../hooks/useLiveSession'
-import { endSession, generateTestQuestions, getHostKey, normalizeCode, triggerClassification, UserFacingError } from '../lib/api'
+import {
+  endSession,
+  generateTestQuestions,
+  getHostKey,
+  normalizeCode,
+  retryClassification,
+  UserFacingError,
+} from '../lib/api'
 import type { Question } from '../lib/types'
 
 export function HostDashboardPage() {
@@ -45,23 +52,6 @@ export function HostDashboardPage() {
 
   const pendingCount = questions.filter((q) => questionState(q, groupsById, now).kind === 'pending').length
 
-  // Safety net: if a question has been waiting a while (e.g. the student's
-  // browser closed before the worker was invoked), nudge the worker again.
-  const lastNudge = useRef(0)
-  useEffect(() => {
-    if (!session || session.status !== 'active') return
-    const stuck = questions.some(
-      (q) =>
-        q.classification_status === 'pending' &&
-        !q.classification_error &&
-        now - new Date(q.created_at).getTime() > ANALYZING_GRACE_MS / 2,
-    )
-    if (stuck && now - lastNudge.current > 30_000) {
-      lastNudge.current = now
-      void triggerClassification(session.id)
-    }
-  }, [questions, now, session])
-
   async function copyCode() {
     try {
       await navigator.clipboard.writeText(code)
@@ -75,12 +65,13 @@ export function HostDashboardPage() {
   async function runDemo() {
     if (!session) return
     setActionError(null)
-    setDemoProgress('Starting…')
+    setDemoProgress('Adding questions…')
     try {
-      await generateTestQuestions(session, (done, total) => setDemoProgress(`${done}/${total}`))
+      // The server inserts them one by one; they arrive through the live feed.
+      const { duration_ms } = await generateTestQuestions(session.code)
+      setTimeout(() => setDemoProgress(null), duration_ms)
     } catch (err) {
       setActionError(err instanceof UserFacingError ? err.message : 'Could not generate test questions.')
-    } finally {
       setDemoProgress(null)
     }
   }
@@ -88,7 +79,7 @@ export function HostDashboardPage() {
   async function handleEnd() {
     if (!session || !window.confirm('End this session? Students will no longer be able to submit questions.')) return
     try {
-      await endSession(session.id)
+      await endSession(session)
     } catch (err) {
       setActionError(err instanceof UserFacingError ? err.message : 'Could not end the session.')
     }
@@ -159,7 +150,7 @@ export function HostDashboardPage() {
             <ConnectionPill state={connection} ended={!active} />
             {active && (
               <button className="btn-secondary" onClick={runDemo} disabled={demoProgress !== null}>
-                {demoProgress ? `Adding questions ${demoProgress}` : 'Generate Test Questions'}
+                {demoProgress ?? 'Generate Test Questions'}
               </button>
             )}
             {active && isHost && (
@@ -186,7 +177,7 @@ export function HostDashboardPage() {
               </span>
               <button
                 className="ml-auto font-semibold underline underline-offset-2 hover:text-amber-950"
-                onClick={() => void triggerClassification(session.id, { retryFailed: true })}
+                onClick={() => void retryClassification(session.code)}
               >
                 Retry now
               </button>

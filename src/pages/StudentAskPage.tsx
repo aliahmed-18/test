@@ -1,10 +1,16 @@
 import { useEffect, useState, type FormEvent } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { Logo } from '../components/Logo'
-import { findSessionByCode, getStoredParticipant, normalizeCode, submitQuestion, UserFacingError } from '../lib/api'
+import {
+  eventsUrl,
+  findSessionByCode,
+  getStoredParticipant,
+  normalizeCode,
+  submitQuestion,
+  UserFacingError,
+} from '../lib/api'
 import { readJSON, uuid, writeJSON } from '../lib/storage'
-import { supabase } from '../lib/supabase'
-import type { Session } from '../lib/types'
+import type { LiveEvent, Session } from '../lib/types'
 
 const NAME_KEY = 'getit.displayName'
 const askedKey = (sessionId: string) => `getit.asked.${sessionId}`
@@ -38,21 +44,16 @@ export function StudentAskPage() {
   }, [code])
 
   // Close the form live if the instructor ends the session.
-  const sessionId = session?.id
+  const sessionCode = session?.code
   useEffect(() => {
-    if (!sessionId) return
-    const channel = supabase
-      .channel(`student-session:${sessionId}`)
-      .on<Session>(
-        'postgres_changes',
-        { event: 'UPDATE', schema: 'public', table: 'sessions', filter: `id=eq.${sessionId}` },
-        (payload) => setSession(payload.new as Session),
-      )
-      .subscribe()
-    return () => {
-      void supabase.removeChannel(channel)
+    if (!sessionCode) return
+    const source = new EventSource(`${eventsUrl(sessionCode)}?scope=session`)
+    source.onmessage = (message) => {
+      const event = JSON.parse(message.data) as LiveEvent
+      if (event.type === 'session') setSession(event.data)
     }
-  }, [sessionId])
+    return () => source.close()
+  }, [sessionCode])
 
   async function handleSubmit(event: FormEvent) {
     event.preventDefault()

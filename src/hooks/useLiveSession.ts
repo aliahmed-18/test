@@ -1,7 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import type { RealtimePostgresChangesPayload } from '@supabase/supabase-js'
-import { supabase } from '../lib/supabase'
-import type { Participant, Question, QuestionGroup, Session } from '../lib/types'
+import { useCallback, useEffect, useState } from 'react'
+import { eventsUrl, fetchSnapshot, UserFacingError } from '../lib/api'
+import type { LiveEvent, Participant, Question, QuestionGroup, Session } from '../lib/types'
 
 export type ConnectionState = 'connecting' | 'live' | 'reconnecting'
 
@@ -13,18 +12,11 @@ interface LiveSessionState {
   loading: boolean
   error: string | null
   connection: ConnectionState
-  reload: () => Promise<void>
+  reload: () => void
 }
 
-type Row = { id: string }
-
-/** Apply an INSERT/UPDATE/DELETE realtime event to a list keyed by id. */
-function applyChange<T extends Row>(list: T[], payload: RealtimePostgresChangesPayload<T>): T[] {
-  if (payload.eventType === 'DELETE') {
-    const oldId = (payload.old as Partial<T>).id
-    return list.filter((item) => item.id !== oldId)
-  }
-  const row = payload.new as T
+/** Insert or replace a row by id. */
+function upsert<T extends { id: string }>(list: T[], row: T): T[] {
   const index = list.findIndex((item) => item.id === row.id)
   if (index === -1) return [...list, row]
   const next = list.slice()
@@ -32,9 +24,13 @@ function applyChange<T extends Row>(list: T[], payload: RealtimePostgresChangesP
   return next
 }
 
+const RECONNECT_MS = 3000
+
 /**
- * Loads everything for one session and keeps it in sync through Supabase
- * Realtime. On (re)connection it refetches, so nothing is missed while offline.
+ * Subscribes to the Go server's event stream for one session. The first
+ * message is a full snapshot; later messages are row upserts. After any
+ * disconnect the browser reconnects and receives a fresh snapshot, so nothing
+ * that happened while offline is missed.
  */
 export function useLiveSession(code: string): LiveSessionState {
   const [session, setSession] = useState<Session | null>(null)
@@ -44,109 +40,74 @@ export function useLiveSession(code: string): LiveSessionState {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [connection, setConnection] = useState<ConnectionState>('connecting')
-  const sessionIdRef = useRef<string | null>(null)
+  const [attempt, setAttempt] = useState(0)
 
-  const loadAll = useCallback(async () => {
-    const { data: s, error: sessionError } = await supabase
-      .from('sessions')
-      .select('id, code, status, created_at, ended_at')
-      .eq('code', code)
-      .maybeSingle()
-    if (sessionError) throw sessionError
-    if (!s) throw new Error(`No session found with code ${code}.`)
-    sessionIdRef.current = s.id
-
-    const [p, q, g] = await Promise.all([
-      supabase.from('participants').select('*').eq('session_id', s.id),
-      supabase.from('questions').select('*').eq('session_id', s.id).order('created_at', { ascending: true }),
-      supabase.from('question_groups').select('*').eq('session_id', s.id),
-    ])
-    if (p.error) throw p.error
-    if (q.error) throw q.error
-    if (g.error) throw g.error
-
-    setSession(s as Session)
-    setParticipants(p.data as Participant[])
-    setQuestions(q.data as Question[])
-    setGroups(g.data as QuestionGroup[])
-    return s as Session
-  }, [code])
-
-  const reload = useCallback(async () => {
-    try {
-      await loadAll()
-      setError(null)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not load the session.')
-    }
-  }, [loadAll])
+  const reload = useCallback(() => setAttempt((n) => n + 1), [])
 
   useEffect(() => {
-    let cancelled = false
-    let channel: ReturnType<typeof supabase.channel> | null = null
+    let closed = false
+    let retryTimer: ReturnType<typeof setTimeout> | undefined
+    const source = new EventSource(eventsUrl(code))
 
-    ;(async () => {
-      setLoading(true)
-      let s: Session
-      try {
-        s = await loadAll()
-      } catch (err) {
-        if (!cancelled) {
-          setError(err instanceof Error ? err.message : 'Could not load the session.')
+    source.onmessage = (message) => {
+      const event = JSON.parse(message.data) as LiveEvent
+      switch (event.type) {
+        case 'snapshot':
+          setSession(event.data.session)
+          setParticipants(event.data.participants)
+          setQuestions(event.data.questions)
+          setGroups(event.data.groups)
           setLoading(false)
-        }
-        return
+          setError(null)
+          setConnection('live')
+          break
+        case 'session':
+          setSession(event.data)
+          break
+        case 'participant':
+          setParticipants((list) => upsert(list, event.data))
+          break
+        case 'question':
+          setQuestions((list) => upsert(list, event.data))
+          break
+        case 'group':
+          setGroups((list) => upsert(list, event.data))
+          break
       }
-      if (cancelled) return
-      setLoading(false)
+    }
 
-      const filter = `session_id=eq.${s.id}`
-      let hasConnected = false
-      channel = supabase
-        .channel(`session:${s.id}`)
-        .on<Question>('postgres_changes', { event: '*', schema: 'public', table: 'questions', filter }, (payload) =>
-          setQuestions((list) => applyChange(list, payload)),
-        )
-        .on<QuestionGroup>(
-          'postgres_changes',
-          { event: '*', schema: 'public', table: 'question_groups', filter },
-          (payload) => setGroups((list) => applyChange(list, payload)),
-        )
-        .on<Participant>(
-          'postgres_changes',
-          { event: '*', schema: 'public', table: 'participants', filter },
-          (payload) => setParticipants((list) => applyChange(list, payload)),
-        )
-        .on<Session>(
-          'postgres_changes',
-          { event: 'UPDATE', schema: 'public', table: 'sessions', filter: `id=eq.${s.id}` },
-          (payload) => setSession(payload.new as Session),
-        )
-        .subscribe((status) => {
-          if (cancelled) return
-          if (status === 'SUBSCRIBED') {
-            setConnection('live')
-            // Catch up on anything that happened while we were disconnected.
-            if (hasConnected) void reload()
-            hasConnected = true
-          } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
-            setConnection('reconnecting')
+    source.onerror = () => {
+      if (closed) return
+      setConnection('reconnecting')
+      if (source.readyState !== EventSource.CLOSED) return // the browser is retrying on its own
+
+      // The stream was refused (e.g. unknown code, server restarting). Find out why.
+      fetchSnapshot(code)
+        .then(() => {
+          if (!closed) retryTimer = setTimeout(() => setAttempt((n) => n + 1), RECONNECT_MS)
+        })
+        .catch((err: unknown) => {
+          if (closed) return
+          const message = err instanceof UserFacingError ? err.message : 'Could not load the session.'
+          if (/no session found|6 letters/i.test(message)) {
+            setError(message)
+            setLoading(false)
+          } else {
+            retryTimer = setTimeout(() => setAttempt((n) => n + 1), RECONNECT_MS)
           }
         })
-    })()
+    }
 
-    const onOnline = () => void reload()
-    window.addEventListener('online', onOnline)
     const onOffline = () => setConnection('reconnecting')
     window.addEventListener('offline', onOffline)
 
     return () => {
-      cancelled = true
-      window.removeEventListener('online', onOnline)
+      closed = true
+      clearTimeout(retryTimer)
+      source.close()
       window.removeEventListener('offline', onOffline)
-      if (channel) void supabase.removeChannel(channel)
     }
-  }, [loadAll, reload])
+  }, [code, attempt])
 
   return { session, participants, questions, groups, loading, error, connection, reload }
 }

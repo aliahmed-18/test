@@ -1,13 +1,10 @@
 import { Navigate, Route, Routes } from 'react-router-dom'
-import { isSupabaseConfigured } from './lib/supabase'
 import { HomePage } from './pages/HomePage'
 import { HostDashboardPage } from './pages/HostDashboardPage'
 import { StudentJoinPage } from './pages/StudentJoinPage'
 import { StudentAskPage } from './pages/StudentAskPage'
-import { SetupNotice } from './components/SetupNotice'
 
 export default function App() {
-  if (!isSupabaseConfigured) return <SetupNotice />
   return (
     <Routes>
       <Route path="/" element={<HomePage />} />

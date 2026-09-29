@@ -37,3 +37,18 @@ export interface QuestionGroup {
   created_at: string
   updated_at: string
 }
+
+export interface Snapshot {
+  session: Session
+  participants: Participant[]
+  questions: Question[]
+  groups: QuestionGroup[]
+}
+
+/** One message on the live event stream (GET /api/sessions/{code}/events). */
+export type LiveEvent =
+  | { type: 'snapshot'; data: Snapshot }
+  | { type: 'session'; data: Session }
+  | { type: 'participant'; data: Participant }
+  | { type: 'question'; data: Question }
+  | { type: 'group'; data: QuestionGroup }
